@@ -1,0 +1,6 @@
+aioconsole==0.8.0
+pio==0.0.3
+portpicker==1.6.0
+psutil==6.0.0
+pycairo==1.26.1
+PyGObject==3.48.2
