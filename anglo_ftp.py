@@ -69,16 +69,16 @@ async def open_connection_ftp(host_ip, port):
     return creader, cwriter
 
 async def help():
-    command_list={'connect': 'Создаёт соединение с ftp-сервером',
-                 'cd': 'Перемещает по дерикториям',
+    command_list={'connect': 'Создаёт соединение с ftp-сервером\nconnect <ip> <port>',
+                 'cd': 'Перемещает по дерикториям\ncd <directory>',
                  'disc': 'Разрывает соединение с ftp-сервером',
                  'dir': 'Показывает рабочую дерикторию',
-                 'get': 'Загрузка файла на локальный хост',
-                 'ls': 'Показ файлов в рабочей дериктории',
-                 'help': 'Помощь'
+                 'get': 'Загрузка файла на локальный хост\nget <filename>',
+                 'ls': 'Показ файлов в рабочей дериктории\nls <directory|не обязательно>',
+                 'help': 'Помощь\nhelp'
                  }
     for command_item in command_list.items():
-        print(f'{command_item[0]}: {command_item[1]}')
+        print(f'{command_item[1]}\n')
 
 async def create_data_port(reader, writer, method, filename=None):
     local_sock_ip = writer.get_extra_info('sockname')[0]
