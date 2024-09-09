@@ -22,13 +22,16 @@ async def handle_data_port(reader, writer, method_info):
         if os.path.exists(filename):
             os.remove(filename)
     if method=='put':
-        with open(filename, 'rb') as file:
-            chunk_num = 4096
-            while True:
-                chunk = file.read(chunk_num)
-                if not chunk:
-                    break
-                writer.write(chunk)
+        try:
+            with open(filename, 'rb') as file:
+                chunk_num = 4096
+                while True:
+                    chunk = file.read(chunk_num)
+                    if not chunk:
+                        break
+                    writer.write(chunk)
+        except FileNotFoundError:
+            print('File not found')
 
     if method == "print":
         data = await reader.read(4096)
@@ -118,7 +121,7 @@ async def ftp_console():
                    'put': put_file}
     while True:
         inputv = await aioconsole.ainput('ANGLO.FTP> ')
-        command_list = inputv.split(' ')
+        command_list = list(filter(bool,re.split(r'\s?"([\w\s/\\]*)"\s?|\s', inputv)))
         command, command_args = command_list[0], command_list[1:]
         if not command: continue
         if command in create_data_port_list:
@@ -187,12 +190,12 @@ async def get_file(reader, writer, filename):
 
     await print_data(reader)
 
-async def put_file(reader, writer, filename):
+async def put_file(reader, writer, filename, serv_filename=None):
     normal_name = re.split('[\\/]', filename)[-1]
     writer.write(b'TYPE I\r\n')
 
     data_port = await create_data_port(reader, writer, {'method':'put', 'filename':filename})
-    writer.write(b'STOR ' + filename.encode() + b'\r\n')
+    writer.write(b'STOR ' + (serv_filename.encode() if serv_filename else filename.encode()) + b'\r\n')
 
     await print_data(reader)
 
