@@ -12,19 +12,32 @@ import re
 
 data_port = None
 creader, cwriter = None, None
-async def handle_data_port(reader, writer, method, filename=None):
+async def handle_data_port(reader, writer, method_info):
     normal_name = None
+    filename = method_info.get('filename')
+    method = method_info['method']
+
     if method=='write':
         normal_name = re.split('[\\/]', filename)[-1]
         if os.path.exists(filename):
             os.remove(filename)
-    while True:
+    if method=='put':
+        with open(filename, 'rb') as file:
+            chunk_num = 4096
+            while True:
+                chunk = file.read(chunk_num)
+                if not chunk:
+                    break
+                writer.write(chunk)
+
+    if method == "print":
         data = await reader.read(4096)
-        if not data:
-            break
-        if method == "print":
-            print(data.decode())
-        if method == "write":
+        print(data.decode())
+    if method == "write":
+        while True:
+            data = await reader.read(4096)
+            if not data:
+                break
             with open(normal_name, 'ab') as file:
                 file.write(data)
 
@@ -37,7 +50,7 @@ async def open_connection_ftp(host_ip, port):
         creader, cwriter = await asyncio.open_connection(host_ip, port)
     except ConnectionRefusedError:
         print('Не удалось подключиться')
-        return
+        return None, None
 
     client_ip = cwriter.get_extra_info('sockname')[0]
 
@@ -61,11 +74,6 @@ async def open_connection_ftp(host_ip, port):
     data = await creader.read(4096)
     print(data.decode())
 
-    cwriter.write(b'TYPE I\r\n')
-
-    data = await creader.read(4096)
-    print(data.decode())
-
     return creader, cwriter
 
 async def help():
@@ -80,13 +88,15 @@ async def help():
     for command_item in command_list.items():
         print(f'{command_item[1]}\n')
 
-async def create_data_port(reader, writer, method, filename=None):
+async def create_data_port(reader, writer, method_info):
     local_sock_ip = writer.get_extra_info('sockname')[0]
     free_port = portpicker.pick_unused_port()
     bin_free_port = bin(free_port)[2:].rjust(16, '0')
     str_free_port = f'{int(bin_free_port[:8], 2)},{int(bin_free_port[8:], 2)}'.encode('ascii')
+
     writer.write(b'PORT ' + local_sock_ip.replace('.', ',').encode('ascii') + b',' + str_free_port + b'\r\n')
-    handler = partial(handle_data_port, method=method, filename=filename)
+
+    handler = partial(handle_data_port, method_info=method_info)
     data_port = await asyncio.start_server(handler, local_sock_ip, free_port)
 
     return data_port
@@ -96,7 +106,7 @@ async def ftp_console():
     global creader, cwriter
 
     inputv = None
-    create_data_port_list = {'ls', 'disc', 'get', 'cd', 'dir'}
+    create_data_port_list = {'ls', 'disc', 'get', 'cd', 'dir', 'put'}
     action_list = {'ls':ls,
                    'connect':open_connection_ftp,
                    'disc': disconnect,
@@ -104,7 +114,8 @@ async def ftp_console():
                    'cd': cd,
                    'dir': get_dir,
                    'help': help,
-                   'exit': ftp_exit,}
+                   'exit': ftp_exit,
+                   'put': put_file}
     while True:
         inputv = await aioconsole.ainput('ANGLO.FTP> ')
         command_list = inputv.split(' ')
@@ -147,7 +158,7 @@ async def ls(reader, writer, *args):
     global data_port
     if not args:
         args = ['']
-    data_port = await create_data_port(reader, writer, 'print')
+    data_port = await create_data_port(reader, writer, {'method': 'print'})
     writer.write(b'LIST ' + args[0].encode() + b'\r\n')
 
     await print_data(reader)
@@ -167,14 +178,23 @@ async def get_dir(reader, writer):
     await print_data(reader)
 async def get_file(reader, writer, filename):
     normal_name = re.split('[\\/]', filename)[-1]
+    writer.write(b'TYPE I\r\n')
 
     if os.path.exists(normal_name):
         os.remove(normal_name)
-    data_port = await create_data_port(reader, writer, 'write', filename=filename)
+    data_port = await create_data_port(reader, writer, {'method': 'write', 'filename': filename})
     writer.write(b'RETR ' + filename.encode() + b'\r\n')
 
     await print_data(reader)
 
+async def put_file(reader, writer, filename):
+    normal_name = re.split('[\\/]', filename)[-1]
+    writer.write(b'TYPE I\r\n')
+
+    data_port = await create_data_port(reader, writer, {'method':'put', 'filename':filename})
+    writer.write(b'STOR ' + filename.encode() + b'\r\n')
+
+    await print_data(reader)
 
 async def main():
     parser = argparse.ArgumentParser()
