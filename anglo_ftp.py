@@ -11,14 +11,34 @@ import os
 import re
 
 data_port = None
-creader, cwriter = None, None
+client_socket = None
 passive_mode = False
+
+class ClientFTPSocket:
+    def __init__(self, dest_ip, dest_port):
+        self.dest_ip = dest_ip
+        self.dest_port = dest_port
+
+    async def _open_connection(self):
+        self.reader, self.writer = await asyncio.open_connection(self.dest_ip, self.dest_port)
+    def write(self, bytes):
+        self.writer.write(bytes)
+
+    async def read(self, num):
+        return await self.reader.read(num)
+
+async def create_client_socket(dest_ip, dest_port):
+    client_socket = ClientFTPSocket(dest_ip, dest_port)
+    await client_socket._open_connection()
+    return client_socket
+
+
 async def handle_data_port(reader, writer, method_info):
     normal_name = None
     filename = method_info.get('filename')
     method = method_info['method']
 
-    await print_data(creader)
+    await print_data(client_socket)
 
     if method=='write':
         normal_name = re.split('[\\/]', filename)[-1]
@@ -49,37 +69,37 @@ async def handle_data_port(reader, writer, method_info):
 
     writer.close()
     await writer.wait_closed()
-    await print_data(creader)
+    await print_data(client_socket)
 
-async def open_connection_ftp(host_ip, port):
+async def open_connection_ftp(host_ip, port=21):
     global server_ip
     server_ip = host_ip
-    global creader, cwriter
+    global client_socket
     try:
-        creader, cwriter = await asyncio.open_connection(host_ip, port)
+        client_socket = await create_client_socket(host_ip, port)
     except ConnectionRefusedError:
         print('Не удалось подключиться')
         return None, None
 
-    client_ip = cwriter.get_extra_info('sockname')[0]
+    client_ip = client_socket.writer.get_extra_info('sockname')[0]
 
-    await print_data(creader)
+    await print_data(client_socket)
 
     username = await aioconsole.ainput('Введите имя: ')
-    cwriter.write(b'USER ' + username.encode() + b'\r\n')
+    client_socket.write(b'USER ' + username.encode() + b'\r\n')
 
-    await print_data(creader)
+    await print_data(client_socket)
 
     password = getpass('Введите пароль: ')
-    cwriter.write(b'PASS ' + password.encode() + b'\r\n')
+    client_socket.write(b'PASS ' + password.encode() + b'\r\n')
 
-    await print_data(creader)
+    await print_data(client_socket)
 
-    cwriter.write(b'SYST\r\n')
+    client_socket.write(b'SYST\r\n')
 
-    await print_data(creader)
+    await print_data(client_socket)
 
-    return creader, cwriter
+    return client_socket
 
 async def help():
     command_list={'connect': 'Создаёт соединение с ftp-сервером\nconnect <ip> <port>',
@@ -93,30 +113,30 @@ async def help():
     for command_item in command_list.items():
         print(f'{command_item[1]}\n')
 
-async def create_data_port(reader, writer, method_info):
+async def create_data_port(client_socket, method_info):
     global passive_mode, server_ip
-    local_sock_ip = writer.get_extra_info('sockname')[0]
+    local_sock_ip = client_socket.writer.get_extra_info('sockname')[0]
     free_port = portpicker.pick_unused_port()
     bin_free_port = bin(free_port)[2:].rjust(16, '0')
     str_free_port = f'{int(bin_free_port[:8], 2)},{int(bin_free_port[8:], 2)}'.encode('ascii')
 
     if not passive_mode:
-        writer.write(b'PORT ' + local_sock_ip.replace('.', ',').encode('ascii') + b',' + str_free_port + b'\r\n')
-        await writer.drain()
+        client_socket.write(b'PORT ' + local_sock_ip.replace('.', ',').encode('ascii') + b',' + str_free_port + b'\r\n')
+        await client_socket.writer.drain()
         handler = partial(handle_data_port, method_info=method_info)
         data_port = await asyncio.start_server(handler, local_sock_ip, free_port)
     else:
-        passive_port = await get_passive_mode_port(creader, cwriter)
+        passive_port = await get_passive_mode_port(client_socket)
         print("Passive mode is not allowed")
         passive_mode = not passive_mode
-        sreader, data_port = await asyncio.open_connection(server_ip, passive_port)
-        asyncio.create_task(handle_data_port(sreader, data_port, method_info))
+        data_port = await create_client_socket(server_ip, passive_port)
+        asyncio.create_task(handle_data_port(data_port.reader, data_port.writer, method_info))
 
     return data_port
 
 async def ftp_console():
     global data_port
-    global creader, cwriter
+    global client_socket
 
     inputv = None
     create_data_port_list = {'ls', 'disc', 'get', 'cd', 'dir', 'put', 'passive'}
@@ -136,9 +156,9 @@ async def ftp_console():
         command, command_args = (command_list[0], command_list[1:]) if command_list else ['', '']
         if not command: continue
         if command in create_data_port_list:
-            if creader and cwriter:
-                extra_info = cwriter.get_extra_info('sockname')
-                await action_list[command](creader, cwriter, *command_args)
+            if client_socket:
+                extra_info = client_socket.writer.get_extra_info('sockname')
+                await action_list[command](client_socket, *command_args)
             else:
                 print('Сначала подключись к FTP-серверу!')
         else:
@@ -147,14 +167,14 @@ async def ftp_console():
             else:
                 print('Unknown command')
 
-async def passive_mode_change_state(creader, cwriter):
+async def passive_mode_change_state(client_socket):
     global passive_mode
     passive_mode = not passive_mode
-    print('Passive mode: ', passive_mode)
+    print('Passive mode ', ('on' if passive_mode else 'off'))
 
-async def get_passive_mode_port(reader, writer):
-    writer.write(b'PASV\r\n')
-    response = await get_data(reader)
+async def get_passive_mode_port(client_socket):
+    client_socket.write(b'PASV\r\n')
+    response = await get_data(client_socket)
     serv_dp_socket = re.split(r'\(|\)', response)[-2]
     port_bites = serv_dp_socket.split(',')[-2:]
     passive_port = int((bin(int(port_bites[0]))[2:].rjust(8, '0') + \
@@ -163,69 +183,69 @@ async def get_passive_mode_port(reader, writer):
 
 
 
-async def ftp_exit(creader=None, cwriter=None):
+async def ftp_exit(client_socket=None):
     global data_port
-    if creader and cwriter:
+    if client_socket:
         if data_port:
             data_port.close()
-        cwriter.close()
-        await cwriter.wait_closed()
+        client_socket.writer.close()
+        await client_socket.writer.wait_closed()
 
     print('Bye!')
     quit()
-async def print_data(reader):
-    data = await reader.read(4096)
+async def print_data(client_socket):
+    data = await client_socket.read(4096)
     data_str = data.replace(b'0xd0', b'').decode('utf-8')
     print(data_str)
 
-async def get_data(reader):
-    data = await reader.read(4096)
+async def get_data(client_socket):
+    data = await client_socket.read(4096)
     data_str = data.replace(b'0xd0', b'').decode('utf-8')
     print(data_str)
     return data_str
 
-async def ls(reader, writer, *args):
+async def ls(client_socket, *args):
     global data_port
     if not args:
         args = ['']
-    data_port = await create_data_port(reader, writer, {'method': 'print'})
-    writer.write(b'LIST ' + args[0].encode() + b'\r\n')
-    await writer.drain()
+    data_port = await create_data_port(client_socket, {'method': 'print'})
+    client_socket.write(b'LIST ' + args[0].encode() + b'\r\n')
+    await client_socket.writer.drain()
 
-async def disconnect(creader, cwriter):
-    cwriter.close()
-    await cwriter.wait_closed()
+async def disconnect(client_socket, cwriter):
+    client_socket.writer.close()
+    await client_socket.writer.wait_closed()
     print('Disconnected')
 
-async def cd(reader, writer, *args):
+async def cd(client_socket, *args):
     directory = ' '.join(args)
-    writer.write(b'CWD ' + directory.encode() + b'\r\n')
-    await print_data(reader)
+    client_socket.write(b'CWD ' + directory.encode() + b'\r\n')
+    await print_data(client_socket)
 
-async def get_dir(reader, writer):
+async def get_dir(client_socket, writer):
     writer.write(b'PWD\r\n')
-    await print_data(reader)
-async def get_file(reader, writer, filename):
+    await print_data(client_socket)
+async def get_file(client_socket, filename):
     normal_name = re.split('[\\/]', filename)[-1]
-    writer.write(b'TYPE I\r\n')
-    await writer.drain()
-    await print_data(reader)
+    client_socket.write(b'TYPE I\r\n')
+    await client_socket.writer.drain()
+    await print_data(client_socket)
 
     if os.path.exists(normal_name):
         os.remove(normal_name)
-    data_port = await create_data_port(reader, writer, {'method': 'write', 'filename': filename})
-    writer.write(b'RETR ' + filename.encode() + b'\r\n')
+    data_port = await create_data_port(client_socket, {'method': 'write', 'filename': filename})
+    client_socket.write(b'RETR ' + filename.encode() + b'\r\n')
 
-    await print_data(reader)
+    await print_data(client_socket)
 
-async def put_file(reader, writer, filename, serv_filename=None):
+async def put_file(client_socket, filename, serv_filename=None):
     normal_name = re.split('[\\/]', filename)[-1]
-    writer.write(b'TYPE I\r\n')
+    client_socket.write(b'TYPE I\r\n')
 
-    data_port = await create_data_port(reader, writer, {'method':'put', 'filename':filename})
-    writer.write(b'STOR ' + (serv_filename.encode() if serv_filename else filename.encode()) + b'\r\n')
+    data_port = await create_data_port(client_socket, {'method':'put', 'filename':filename})
+    client_socket.write(b'STOR ' + (serv_filename.encode() if serv_filename else filename.encode()) + b'\r\n')
 
-    await print_data(reader)
+    await print_data(client_socket)
 
 async def main():
     parser = argparse.ArgumentParser()
@@ -236,7 +256,7 @@ async def main():
     start_args = dict(parser.parse_args()._get_kwargs())
     if start_args['i']:
         server_ip = start_args['i']
-        creader, cwriter = await open_connection_ftp(server_ip, start_args['p'])
+        client_socket = await open_connection_ftp(server_ip, start_args['p'])
     ftp_console_task = asyncio.create_task(ftp_console())
 
     try:
