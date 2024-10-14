@@ -9,106 +9,123 @@ import aioconsole
 from functools import partial
 import os
 import re
+import ssl
 
 data_port = None
 client_socket = None
-passive_mode = False
+# passive_mode = False
 
-class ClientFTPSocket:
+class BasicFTPSocket(socket.socket):
+    def __init__(self):
+        super().__init__(socket.AF_INET, socket.SOCK_STREAM)
+        self.loop = asyncio.get_event_loop()
+    async def write(self, bytes):
+        await self.loop.sock_sendall(self, bytes)
+
+    async def read(self, max_bytes):
+        data = await self.loop.sock_recv(self, max_bytes)
+        return data
+
+class ControlFTPSocket(BasicFTPSocket):
     def __init__(self, dest_ip, dest_port):
-        self.dest_ip = dest_ip
-        self.dest_port = dest_port
-        self.reader = None
-        self.writer = None
+        super().__init__()
+        self.connect((dest_ip, dest_port))
+        self.setblocking(False)
 
-    async def _open_connection(self):
-        self.reader, self.writer = await asyncio.open_connection(self.dest_ip, self.dest_port)
+class DataPortFTPSocket(BasicFTPSocket):
+    async def server_handler(self, sock, method_info):
+        normal_name = None
+        filename = method_info.get('filename')
+        method = method_info['method']
+        data = None
 
-    def write(self, bytes):
-        self.writer.write(bytes)
-
-    async def read(self, num):
-        return await self.reader.read(num)
-
-# class PasvNotAllowed(Exception):
-#     pass
-
-async def create_client_socket(dest_ip, dest_port):
-    client_socket = ClientFTPSocket(dest_ip, dest_port)
-    await client_socket._open_connection()
-    return client_socket
-
-
-async def handle_data_port(reader, writer, method_info):
-    global client_socket
-    normal_name = None
-    filename = method_info.get('filename')
-    method = method_info['method']
-
-    print('\n')
-
-    if method=='write':
-        normal_name = re.split('[\\/]', filename)[-1]
-        if os.path.exists(filename):
-            os.remove(filename)
-        with open(normal_name, 'wb') as file:
-            while True:
-                data = await reader.read(65355)
-                if not data:
-                    break
-                file.write(data)
-                file.flush()
-    if method=='put':
-        try:
-            with open(filename, 'rb') as file:
-                chunk_num = 4096
+        if method == 'write':
+            normal_name = re.split('[\\/]', filename)[-1]
+            with open(method_info['to_dir'] + '/' + normal_name, 'wb') as file:
                 while True:
-                    chunk = file.read(chunk_num)
-                    if not chunk:
+                    data = await self.loop.sock_recv(sock, 65355)
+                    if not data:
                         break
-                    writer.write(chunk)
-        except FileNotFoundError:
-            print('File not found')
+                    file.write(data)
+                    file.flush()
+        if method == 'put':
+            try:
+                with open(filename, 'rb') as file:
+                    chunk_num = 66543
+                    while True:
+                        chunk = file.read(chunk_num)
+                        if not chunk:
+                            break
+                        sock.sendall(chunk)
+            except FileNotFoundError:
+                print('File not found')
+                return {'state': 'successful', 'error': 'FileNotFount', 'data': None}
 
-    if method == "print":
-        data = await reader.read(4096)
-        print(data.decode()[:-2])
+        if method == "print":
+            data = (await self.loop.sock_recv(sock, 4096)).decode()[:-2]
+            print(data)
+        sock.close()
+        return {'state': 'successful', 'data': data}
 
-    writer.close()
-    await writer.wait_closed()
-    await get_data(client_socket, print_data=True)
+class DataPortClientFTPSocket(DataPortFTPSocket):
+    def __init__(self, dest_ip, dest_port):
+        super().__init__()
+        self.connect((dest_ip, dest_port))
+        self.setblocking(False)
 
-async def open_connection_ftp(host_ip, port=21):
+    async def start_serving(self, method_info):
+        data = await self.server_handler(self, method_info)
+        return data
+
+class DataPortServerFTPSocket(DataPortFTPSocket):
+    def __init__(self, dest_ip, dest_port):
+        super().__init__()
+        self.bind((dest_ip, dest_port))
+        self.listen(1)
+        self.setblocking(False)
+
+    async def start_serving(self, method_info):
+        sock,_ = await self.loop.sock_accept(self)
+        data = await self.server_handler(sock, method_info)
+        return data
+
+async def open_connection_ftp(host_ip, port=21, need_inp=True, passive_mode=False, **kwargs):
     global server_ip
     server_ip = host_ip
     global client_socket
     try:
-        client_socket = await create_client_socket(host_ip, port)
+        client_socket = ControlFTPSocket(host_ip, port)
+        client_socket.passive_mode = passive_mode
     except ConnectionRefusedError:
         print('Не удалось подключиться')
-        return None, None
+        return None
 
-    client_ip = client_socket.writer.get_extra_info('sockname')[0]
-
-    await get_data(client_socket, print_data=True)
-
-    username = await aioconsole.ainput('Введите имя: ')
-    client_socket.write(b'USER ' + username.encode() + b'\r\n')
+    client_ip = client_socket.getsockname()[0]
 
     await get_data(client_socket, print_data=True)
 
-    password = getpass('Введите пароль: ')
-    client_socket.write(b'PASS ' + password.encode() + b'\r\n')
+    if need_inp:
+        username = await aioconsole.ainput('Введите имя: ')
+    else:
+        username = kwargs['username']
+    await client_socket.write(b'USER ' + username.encode() + b'\r\n')
+
+    await get_data(client_socket, print_data=True)
+
+    if need_inp:
+        password = getpass('Введите пароль: ')
+    else:
+        password = kwargs['password']
+    await client_socket.write(b'PASS ' + password.encode() + b'\r\n')
 
     auth_state = (await get_data(client_socket, print_data=True))[:3]
     if auth_state == '230':
-        client_socket.write(b'SYST\r\n')
+        await client_socket.write(b'SYST\r\n')
 
         await get_data(client_socket, print_data=True)
         return client_socket
     else:
-        client_socket.writer.close()
-        await client_socket.writer.wait_closed()
+        client_socket.close()
         return None
 
 
@@ -124,23 +141,24 @@ async def help():
     for command_item in command_list.items():
         print(f'{command_item[1]}\n')
 
-async def create_data_port(client_socket, method_info):
-    global passive_mode, server_ip
-    local_sock_ip = client_socket.writer.get_extra_info('sockname')[0]
+async def create_data_port(client_socket: ControlFTPSocket):
+    global server_ip
+
+    loop = asyncio.get_event_loop()
+    print(client_socket)
+    local_sock_ip = client_socket.getsockname()[0]
     free_port = portpicker.pick_unused_port()
     bin_free_port = bin(free_port)[2:].rjust(16, '0')
     str_free_port = f'{int(bin_free_port[:8], 2)},{int(bin_free_port[8:], 2)}'.encode('ascii')
 
-    if not passive_mode:
-        client_socket.write(b'PORT ' + local_sock_ip.replace('.', ',').encode('ascii') + b',' + str_free_port + b'\r\n')
-        await client_socket.writer.drain()
-        handler = partial(handle_data_port, method_info=method_info)
-        data_port = await asyncio.start_server(handler, local_sock_ip, free_port)
+    if not client_socket.passive_mode:
+        await client_socket.write(b'PORT ' + local_sock_ip.replace('.', ',').encode('ascii') + b',' + str_free_port + b'\r\n')
+        port_response = await get_data(client_socket, print_data=True)
+
+        data_port = DataPortServerFTPSocket(local_sock_ip, free_port)
     else:
-        print(passive_mode)
         passive_port = await get_passive_mode_port(client_socket)
-        data_port = await create_client_socket(server_ip, passive_port)
-        asyncio.create_task(handle_data_port(data_port.reader, data_port.writer, method_info))
+        data_port = DataPortServerFTPSocket(server_ip, passive_port)
 
     return data_port
 
@@ -167,14 +185,14 @@ async def ftp_console():
         if not command: continue
         if command in create_data_port_list:
             if client_socket:
-                extra_info = client_socket.writer.get_extra_info('sockname')
-                try:
-                    await action_list[command](client_socket, *command_args)
-                except Exception as error:
-                    if hasattr(error, 'message'):
-                        print(error.message)
-                    else:
-                        print(error)
+                extra_info = client_socket.getsockname()[0]
+                # try:
+                await action_list[command](client_socket, *command_args)
+                # except Exception as error:
+                #     if hasattr(error, 'message'):
+                #         print(error.message)
+                #     else:
+                #         print(error)
             else:
                 print('Сначала подключись к FTP-серверу!')
         else:
@@ -184,15 +202,14 @@ async def ftp_console():
                 print('Unknown command')
 
 async def passive_mode_change_state(client_socket):
-    global passive_mode
-    passive_mode = not passive_mode
-    print('Passive mode ', ('on' if passive_mode else 'off'))
+    client_socket.passive_mode = client_socket.passive_mode
+    print('Passive mode ', ('on' if client_socket.passive_mode else 'off'))
 
 async def get_passive_mode_port(client_socket):
-    client_socket.write(b'PASV\r\n')
+    await client_socket.write(b'PASV\r\n')
     response = await get_data(client_socket, print_data=True)
     if response[:3] != '227':
-        passive_mode = False
+        client_socket.passive_mode = False
         raise Exception('Passive port not allowed')
     serv_dp_socket = re.split(r'\(|\)', response)[-2]
     port_bites = serv_dp_socket.split(',')[-2:]
@@ -200,21 +217,17 @@ async def get_passive_mode_port(client_socket):
                         bin(int(port_bites[1]))[2:].rjust(8, '0')), 2)
     return passive_port
 
-
-
 async def ftp_exit(client_socket=None):
     global data_port
     if client_socket:
         if data_port:
             data_port.close()
-        client_socket.writer.close()
-        await client_socket.writer.wait_closed()
+        client_socket.close()
 
     print('Bye!')
     quit()
 
 async def get_data(ftp_socket, print_data=False):
-    print('waiting for data')
     data = await ftp_socket.read(4096)
     data_str = data.replace(b'0xd0', b'').decode('utf-8')[:-2]
     if print_data:
@@ -222,47 +235,64 @@ async def get_data(ftp_socket, print_data=False):
     return data_str
 
 async def ls(client_socket, *args):
-    global data_port
     if not args:
         args = ['']
-    data_port = await create_data_port(client_socket, {'method': 'print'})
-    client_socket.write(b'LIST ' + args[0].encode() + b'\r\n')
-    await client_socket.writer.drain()
+    data_port = await create_data_port(client_socket)
+    await client_socket.write(b'LIST ' + args[0].encode() + b'\r\n')
+    dp_state = await get_data(client_socket, print_data=True)
+    response = await data_port.start_serving({'method': 'print'})
+    if response['state'] == 'successful':
+        if dp_state[:3] == '150':
+            await get_data(client_socket, print_data=True)
+    return response
 
 async def disconnect(client_socket):
-    client_socket.writer.close()
-    await client_socket.writer.wait_closed()
+    client_socket.close()
     print('Disconnected')
 
 async def cd(client_socket, *args):
     directory = ' '.join(args)
-    client_socket.write(b'CWD ' + directory.encode() + b'\r\n')
+    await client_socket.write(b'CWD ' + directory.encode() + b'\r\n')
     await get_data(client_socket, print_data=True)
 
-async def get_dir(client_socket, writer):
-    writer.write(b'PWD\r\n')
+async def get_dir(client_socket):
+    await client_socket.write(b'PWD\r\n')
     await get_data(client_socket, print_data=True)
-async def get_file(client_socket, filename):
+async def get_file(client_socket, filename, to_dir):
     normal_name = re.split('[\\/]', filename)[-1]
-    client_socket.write(b'TYPE I\r\n')
-    await client_socket.writer.drain()
-    await get_data(client_socket, print_data=True)
+    await client_socket.write(b'TYPE I\r\n')
+    type_response = await get_data(client_socket, print_data=True)
+    file_path = (to_dir if to_dir != '/' else '') + '/' + filename
+    if os.path.exists(file_path):
+        os.remove(file_path)
 
-    if os.path.exists(normal_name):
-        os.remove(normal_name)
-
-    data_port = await create_data_port(client_socket, {'method': 'write', 'filename': filename})
-    client_socket.write(b'RETR ' + filename.encode() + b'\r\n')
-    await get_data(client_socket, print_data=True)
+    data_port = await create_data_port(client_socket)
+    await client_socket.write(b'RETR ' + filename.encode() + b'\r\n')
+    retr_state = await get_data(client_socket, print_data=True)
+    response = await data_port.start_serving({'method': 'write', 'filename': filename, 'to_dir':to_dir})
+    return response
 
 async def put_file(client_socket, filename, serv_filename=None):
     normal_name = re.split('[\\/]', filename)[-1]
-    client_socket.write(b'TYPE I\r\n')
-
-    data_port = await create_data_port(client_socket, {'method':'put', 'filename':filename})
-    client_socket.write(b'STOR ' + (serv_filename.encode() if serv_filename else filename.encode()) + b'\r\n')
-
+    await client_socket.write(b'TYPE I\r\n')
     await get_data(client_socket, print_data=True)
+
+    data_port = await create_data_port(client_socket)
+    await client_socket.write(b'STOR ' + (serv_filename.encode() if serv_filename else filename.encode()) + b'\r\n')
+    stor_response = await get_data(client_socket, print_data=True)
+    if stor_response[:3] == '550':
+        return {'state':'error', 'error':'PermissionError', 'data':None}
+    response = await data_port.start_serving({'method':'put', 'filename':filename})
+    await get_data(client_socket, print_data=True)
+    return response
+
+async def del_file(client_socket, filepath):
+    await client_socket.write(b'DELE ' + filepath.encode() + b'\r\n')
+    response = await get_data(client_socket, print_data=True)
+    if response[:3] == '250':
+        return {'state':'successful'}
+    else:
+        return {'state':'error', 'error':'FileDoesNotExist'}
 
 async def main():
     global client_socket
